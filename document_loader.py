@@ -9,13 +9,6 @@ from pypdf import PdfReader
 def extract_text(file_name, file_bytes):
     """
     Extract readable text from PDF, DOCX, CSV, or TXT files.
-
-    Args:
-        file_name: Original name of the uploaded file.
-        file_bytes: Contents of the file as bytes.
-
-    Returns:
-        Extracted text as a string.
     """
 
     extension = file_name.lower().rsplit(".", 1)[-1]
@@ -56,3 +49,26 @@ def extract_text(file_name, file_bytes):
         )
 
     return text
+
+
+def extract_csv_records(file_name, file_bytes):
+    """
+    Extract CSV data as a list of dictionaries,
+    with one dictionary per row.
+    """
+
+    extension = file_name.lower().rsplit(".", 1)[-1]
+
+    if extension != "csv":
+        raise ValueError(
+            "This function only supports CSV files."
+        )
+
+    dataframe = pd.read_csv(
+        StringIO(file_bytes.decode("utf-8-sig"))
+    )
+
+    dataframe.columns = dataframe.columns.str.strip()
+    dataframe = dataframe.fillna("")
+
+    return dataframe.to_dict(orient="records")

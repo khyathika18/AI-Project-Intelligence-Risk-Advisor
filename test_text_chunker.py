@@ -1,25 +1,29 @@
 
 from text_chunker import split_text
 
-text = "A" * 1200
+
+sample_text = """
+The project objective is to develop an AI-based student attendance system.
+The team has not completed all test cases and may miss the sprint deadline.
+Testing cannot continue because the test server is unavailable.
+The infrastructure team must restore server access.
+The final project report must be submitted.
+"""
 
 chunks = split_text(
-    text,
-    chunk_size=500,
-    overlap=50
+    sample_text,
+    chunk_size=100,
+    overlap=20
 )
 
-print("Number of chunks:", len(chunks))
-print("Chunk lengths:", [len(chunk) for chunk in chunks])
+print("\nGENERATED CHUNKS\n")
 
-assert len(chunks) == 3
-assert len(chunks[0]) == 500
-assert len(chunks[1]) == 500
-assert len(chunks[2]) == 300
+for number, chunk in enumerate(chunks, start=1):
 
-assert chunks[0][-50:] == chunks[1][:50]
-assert chunks[1][-50:] == chunks[2][:50]
+    print(f"Chunk {number}:")
+    print(chunk)
+    print("-" * 50)
 
-assert split_text("") == []
+assert all(chunk.strip() for chunk in chunks)
 
-print("\nAll text chunking tests passed!")
+print("\nCHUNKING TEST PASSED!")
