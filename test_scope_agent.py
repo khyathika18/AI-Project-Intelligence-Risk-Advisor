@@ -1,19 +1,22 @@
-
 from scope_agent import extract_scope
 
 sample_text = """
-Project objective: Build a student attendance system.
-Deliverable: Submit the final project report.
-Milestone: Complete testing by Week 4.
+Project Objective: Develop an AI-based student attendance system.
+Project Objective: Develop a web-based system that allows faculty members to record student attendance and view attendance reports.
+
+Project Deliverable: Submit the final project report.
+Project Deliverable: Submit the working application, source code, and final project report.
+
+Project Milestone: Complete testing by Week 4.
+Project Milestone: Finish system testing by Week 5.
+
+Assigned to Priya: Complete the database documentation.
 Responsible for testing: Ravi.
 """
 
 result = extract_scope(sample_text)
 
-for category, items in result.items():
+for category, statements in result.items():
     print(f"\n{category.upper()}:")
-    if items:
-        for item in items:
-            print("-", item)
-    else:
-        print("- None found")
+    for statement in statements:
+        print("-", statement)

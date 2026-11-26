@@ -2,7 +2,6 @@
 import re
 import string
 import streamlit as st
-
 import json
 import csv
 import io
@@ -11,18 +10,18 @@ import hashlib
 from document_loader import extract_text
 from text_chunker import split_text
 from scope_agent import extract_scope
-from risk_agent import detect_risks
+from risk_agent import detect_risks, reconcile_risks
 from action_item_agent import identify_blockers_and_actions
 from documentation_agent import generate_documentation
 from health_scoring import calculate_health_score
 
-
-
 from conversational_agent import (
     build_knowledge_base,
+    add_chunks_to_knowledge_base,
     ask_project_question,
-    generate_project_answer
+    generate_project_answer,
 )
+
 
 # --------------------------------------------------
 # PAGE CONFIGURATION
@@ -36,14 +35,19 @@ st.set_page_config(
 
 
 # --------------------------------------------------
-# SESSION STATE INITIALIZATION
+# SESSION STATE
 # --------------------------------------------------
 
-if "knowledge_base" not in st.session_state:
-    st.session_state.knowledge_base = None
+DEFAULT_STATE = {
+    "knowledge_base": None,
+    "processed_documents": {},
+    "analysis_results": None,
+    "last_qa": None,
+}
 
-if "processed_files_hash" not in st.session_state:
-    st.session_state.processed_files_hash = None
+for state_key, default_value in DEFAULT_STATE.items():
+    if state_key not in st.session_state:
+        st.session_state[state_key] = default_value
 
 
 # --------------------------------------------------
@@ -53,8 +57,8 @@ if "processed_files_hash" not in st.session_state:
 st.title("AI Project Intelligence & Risk Advisor")
 
 st.write(
-    "Upload project documents to generate one consolidated "
-    "analysis report across all uploaded files."
+    "Upload project documents to build a persistent project knowledge base, "
+    "generate consolidated analysis, and ask questions about the project."
 )
 
 
@@ -63,17 +67,14 @@ st.write(
 # --------------------------------------------------
 
 def records_to_csv(records):
-
     if not records:
         return ""
 
     output = io.StringIO()
-
     writer = csv.DictWriter(
         output,
         fieldnames=records[0].keys()
     )
-
     writer.writeheader()
     writer.writerows(records)
 
@@ -81,32 +82,131 @@ def records_to_csv(records):
 
 
 def normalize_text(value):
-
     text = str(value).lower().strip()
 
-    text = re.sub(r"^\s*[-*•\d.)]+\s*", "", text)
+    text = re.sub(
+        r"^\s*[-*•\d.)]+\s*",
+        "",
+        text
+    )
 
     text = text.translate(
         str.maketrans("", "", string.punctuation)
     )
 
-    text = " ".join(text.split())
+    return " ".join(text.split())
 
-    return text
+
+def add_unique(items, item):
+    if item is None:
+        return
+
+    if isinstance(item, dict):
+        key = normalize_text(
+            " ".join(
+                f"{k}: {v}"
+                for k, v in item.items()
+                if v is not None
+            )
+        )
+    else:
+        key = normalize_text(item)
+
+    if not key:
+        return
+
+    for existing in items:
+        if isinstance(existing, dict):
+            existing_key = normalize_text(
+                " ".join(
+                    f"{k}: {v}"
+                    for k, v in existing.items()
+                    if v is not None
+                )
+            )
+        else:
+            existing_key = normalize_text(existing)
+
+        if existing_key == key:
+            return
+
+    items.append(item)
+
+
+def to_list(result):
+    if result is None:
+        return []
+
+    if isinstance(result, list):
+        return result
+
+    if isinstance(result, tuple):
+        return list(result)
+
+    if isinstance(result, dict):
+        return [
+            {"category": key, "details": value}
+            for key, value in result.items()
+            if value is not None
+        ]
+
+    if isinstance(result, str):
+        return [result] if result.strip() else []
+
+    return [str(result)]
+
+
+def display_item(item):
+    if isinstance(item, dict):
+        for key, value in item.items():
+            if value is not None:
+                label = str(key).replace("_", " ").title()
+                st.write(f"**{label}:** {value}")
+    else:
+        st.write(str(item))
+
+
+def extract_document_content(filename, file_bytes):
+    try:
+        text = extract_text(filename, file_bytes)
+
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        return ""
+
+    except Exception as error:
+        st.warning(
+            f"Text extraction failed for {filename}: {error}"
+        )
+        return ""
+
+
+def get_file_hash(uploaded_file):
+    digest = hashlib.sha256()
+
+    digest.update(
+        uploaded_file.name.encode("utf-8")
+    )
+
+    digest.update(
+        uploaded_file.getvalue()
+    )
+
+    return digest.hexdigest()
 
 
 def deduplicate_documents(documents):
+    """Remove repeated non-empty lines across the complete document collection."""
 
     seen_lines = set()
     cleaned_documents = []
     duplicate_count = 0
 
-    for filename, content in documents:
-
+    for _, content in documents:
         unique_lines = []
 
         for line in content.splitlines():
-
             original_line = line.strip()
 
             if not original_line:
@@ -118,7 +218,6 @@ def deduplicate_documents(documents):
                 continue
 
             if normalized_line in seen_lines:
-
                 duplicate_count += 1
                 continue
 
@@ -126,146 +225,210 @@ def deduplicate_documents(documents):
             unique_lines.append(original_line)
 
         if unique_lines:
-
             cleaned_documents.append(
                 "\n".join(unique_lines)
             )
 
-    cleaned_text = "\n\n".join(cleaned_documents)
-
-    return cleaned_text, duplicate_count
-
-
-def add_unique(items, item):
-
-    if item is None:
-        return
-
-    if isinstance(item, dict):
-
-        key = normalize_text(
-            " ".join(
-                f"{k}: {v}"
-                for k, v in item.items()
-                if v is not None
-            )
-        )
-
-    else:
-
-        key = normalize_text(item)
-
-    if not key:
-        return
-
-    for existing in items:
-
-        if isinstance(existing, dict):
-
-            existing_key = normalize_text(
-                " ".join(
-                    f"{k}: {v}"
-                    for k, v in existing.items()
-                    if v is not None
-                )
-            )
-
-        else:
-
-            existing_key = normalize_text(existing)
-
-        if existing_key == key:
-            return
-
-    items.append(item)
+    return (
+        "\n\n".join(cleaned_documents),
+        duplicate_count
+    )
 
 
-def to_list(result):
+# --------------------------------------------------
+# CONSOLIDATED PROJECT ANALYSIS
+# --------------------------------------------------
 
-    if result is None:
-        return []
+def run_consolidated_analysis(cleaned_text):
+    """Run all project agents and reconcile current blocker/risk status."""
 
-    if isinstance(result, list):
-        return result
+    scope_results = {}
+    unique_risks = []
+    active_blockers = []
+    resolved_blockers = []
+    blocker_status = []
+    action_items = []
+    documentation = {}
+    health = None
+    errors = {}
 
-    if isinstance(result, tuple):
-        return list(result)
-
-    if isinstance(result, dict):
-
-        return [
-            {"category": key, "details": value}
-            for key, value in result.items()
-            if value is not None
-        ]
-
-    if isinstance(result, str):
-
-        return [result] if result.strip() else []
-
-    return [str(result)]
-
-
-def display_item(item):
-
-    if isinstance(item, dict):
-
-        for key, value in item.items():
-
-            if value is not None:
-
-                label = str(key).replace(
-                    "_", " "
-                ).title()
-
-                st.write(f"**{label}:** {value}")
-
-    else:
-
-        st.write(str(item))
-
-
-def extract_document_content(uploaded_file):
-
-    filename = uploaded_file.name
-    file_bytes = uploaded_file.getvalue()
+    # 1. Scope and deliverables
 
     try:
-
-        text = extract_text(
-            filename,
-            file_bytes
-        )
-
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-
-        return ""
+        scope_results = extract_scope(cleaned_text)
 
     except Exception as error:
+        errors["scope"] = str(error)
 
-        st.warning(
-            f"Text extraction failed for {filename}: {error}"
+    # 2. Risk detection and status reconciliation
+
+    try:
+        raw_risks = detect_risks(cleaned_text)
+
+        for risk in to_list(raw_risks):
+            add_unique(unique_risks, risk)
+
+        unique_risks = reconcile_risks(
+            cleaned_text,
+            unique_risks,
         )
 
-        return ""
+    except Exception as error:
+        errors["risks"] = str(error)
 
+    # 3. Blocker status and action-item extraction
 
-def get_uploaded_files_hash(files):
-
-    file_hash = hashlib.sha256()
-
-    for uploaded_file in files:
-
-        file_hash.update(
-            uploaded_file.name.encode("utf-8")
+    try:
+        action_results = identify_blockers_and_actions(
+            cleaned_text
         )
 
-        file_hash.update(
-            uploaded_file.getvalue()
+        if isinstance(action_results, dict):
+
+            raw_blockers = action_results.get(
+                "blockers", []
+            )
+
+            raw_resolved = action_results.get(
+                "resolved_blockers", []
+            )
+
+            raw_status = action_results.get(
+                "blocker_status", []
+            )
+
+            raw_actions = action_results.get(
+                "action_items",
+                action_results.get(
+                    "actions",
+                    action_results.get(
+                        "identified_actions", []
+                    ),
+                ),
+            )
+
+            for item in to_list(raw_blockers):
+                add_unique(active_blockers, item)
+
+            for item in to_list(raw_resolved):
+                add_unique(resolved_blockers, item)
+
+            for item in to_list(raw_status):
+                add_unique(blocker_status, item)
+
+            for item in to_list(raw_actions):
+                add_unique(action_items, item)
+
+        elif isinstance(action_results, tuple) and len(action_results) == 2:
+
+            for item in to_list(action_results[0]):
+                add_unique(active_blockers, item)
+
+            for item in to_list(action_results[1]):
+                add_unique(action_items, item)
+
+        elif action_results:
+
+            for item in to_list(action_results):
+                add_unique(action_items, item)
+
+    except Exception as error:
+        errors["blockers_and_actions"] = str(error)
+
+    # 4. Documentation generation
+
+    try:
+        documentation = generate_documentation(
+            scope_results,
+            unique_risks,
+            action_items,
         )
 
-    return file_hash.hexdigest()
+        if not isinstance(documentation, dict):
+            documentation = {}
+
+    except Exception as error:
+        errors["documentation"] = str(error)
+
+    # 5. Health scoring uses active blockers only
+
+    try:
+        health = calculate_health_score(
+            scope_results,
+            unique_risks,
+            active_blockers,
+        )
+
+    except Exception as error:
+        errors["health"] = str(error)
+
+    return {
+        "scope_results": scope_results,
+        "risks": unique_risks,
+        "blockers": active_blockers,
+        "resolved_blockers": resolved_blockers,
+        "blocker_status": blocker_status,
+        "action_items": action_items,
+        "documentation": documentation,
+        "health": health,
+        "errors": errors,
+        "cleaned_text": cleaned_text,
+    }
+
+
+# --------------------------------------------------
+# DISPLAY FUNCTIONS
+# --------------------------------------------------
+
+def render_scope_summary(scope_results):
+
+    if isinstance(scope_results, dict):
+
+        for category, details in scope_results.items():
+
+            st.markdown(
+                f"**{str(category).replace('_', ' ').title()}**"
+            )
+
+            if isinstance(details, (list, tuple)):
+
+                if details:
+                    for detail in details:
+                        st.write(f"- {detail}")
+
+                else:
+                    st.write("No matching information found.")
+
+            elif details:
+                st.write(details)
+
+            else:
+                st.write("No matching information found.")
+
+    elif scope_results:
+
+        for item in to_list(scope_results):
+            display_item(item)
+
+    else:
+        st.info("No scope information was detected.")
+
+
+def render_list_of_items(items, item_label):
+
+    if not items:
+        st.info(
+            f"No {item_label.lower()} detected."
+        )
+        return
+
+    for index, item in enumerate(items, start=1):
+
+        st.markdown(
+            f"**{item_label} {index}**"
+        )
+
+        display_item(item)
 
 
 # --------------------------------------------------
@@ -276,670 +439,616 @@ uploaded_files = st.file_uploader(
     "Upload project documents",
     type=["pdf", "docx", "csv", "txt"],
     accept_multiple_files=True,
+    help=(
+        "You can upload additional documents later. Previously processed "
+        "documents remain in this session even if they are no longer selected."
+    ),
 )
 
 
-if not uploaded_files:
+if uploaded_files:
 
-    st.session_state.knowledge_base = None
-    st.session_state.processed_files_hash = None
-
-    st.info(
-        "Upload one or more project documents to begin."
+    st.write(
+        f"**Files selected in this upload:** {len(uploaded_files)}"
     )
 
-    st.stop()
+    for uploaded_file in uploaded_files:
+        st.write(f"📄 {uploaded_file.name}")
 
 
-st.write(f"**Files uploaded:** {len(uploaded_files)}")
-
-for uploaded_file in uploaded_files:
-
-    st.write(f"📄 {uploaded_file.name}")
-
-
-# Check whether the uploaded documents have changed.
-
-current_files_hash = get_uploaded_files_hash(
-    uploaded_files
+st.caption(
+    f"Documents retained in this session: "
+    f"{len(st.session_state.processed_documents)}"
 )
-
-if (
-    st.session_state.processed_files_hash is not None
-    and st.session_state.processed_files_hash != current_files_hash
-):
-
-    st.session_state.knowledge_base = None
-    st.session_state.processed_files_hash = None
 
 
 # --------------------------------------------------
-# GENERATE CONSOLIDATED REPORT
+# PROCESS NEW DOCUMENTS / UPDATE KNOWLEDGE BASE
 # --------------------------------------------------
 
 if st.button(
-    "Generate Consolidated Report",
+    "Process New Documents / Update Project",
     type="primary"
 ):
 
-    all_documents = []
-    successful_files = []
+    new_documents = []
+    new_chunks = []
+    extraction_failures = []
+    duplicate_uploads = 0
 
-    # --------------------------------------------------
-    # STEP 1: DOCUMENT EXTRACTION
-    # --------------------------------------------------
+    with st.spinner(
+        "Checking and extracting newly uploaded documents..."
+    ):
 
-    st.header("1. Document Extraction")
+        for uploaded_file in uploaded_files or []:
 
-    with st.spinner("Extracting uploaded documents..."):
+            file_hash = get_file_hash(uploaded_file)
 
-        for uploaded_file in uploaded_files:
+            if file_hash in st.session_state.processed_documents:
+                duplicate_uploads += 1
+                continue
 
             document_text = extract_document_content(
-                uploaded_file
+                uploaded_file.name,
+                uploaded_file.getvalue(),
             )
 
-            if document_text:
-
-                all_documents.append(
-                    (uploaded_file.name, document_text)
-                )
-
-                successful_files.append(
+            if not document_text:
+                extraction_failures.append(
                     uploaded_file.name
                 )
+                continue
 
-    if not all_documents:
+            try:
 
-        st.session_state.knowledge_base = None
-        st.session_state.processed_files_hash = None
+                document_chunks = split_text(
+                    document_text,
+                    chunk_size=500,
+                    overlap=50,
+                )
+
+                document_chunks = [
+                    chunk.strip()
+                    for chunk in (document_chunks or [])
+                    if isinstance(chunk, str) and chunk.strip()
+                ]
+
+            except Exception as error:
+
+                st.error(
+                    f"Chunking failed for {uploaded_file.name}: {error}"
+                )
+
+                continue
+
+            new_documents.append(
+                {
+                    "hash": file_hash,
+                    "file_name": uploaded_file.name,
+                    "text": document_text,
+                    "chunks": document_chunks,
+                }
+            )
+
+            new_chunks.extend(document_chunks)
+
+    # Update the existing FAISS knowledge base.
+
+    try:
+
+        if new_chunks:
+
+            with st.spinner(
+                "Updating the project knowledge base..."
+            ):
+
+                if st.session_state.knowledge_base is None:
+
+                    unique_initial_chunks = list(
+                        dict.fromkeys(new_chunks)
+                    )
+
+                    st.session_state.knowledge_base = (
+                        build_knowledge_base(
+                            unique_initial_chunks
+                        )
+                    )
+
+                    kb_update = {
+                        "added": len(unique_initial_chunks),
+                        "skipped": (
+                            len(new_chunks)
+                            - len(unique_initial_chunks)
+                        ),
+                        "total_chunks": len(
+                            st.session_state.knowledge_base["chunks"]
+                        ),
+                    }
+
+                else:
+
+                    kb_update = add_chunks_to_knowledge_base(
+                        st.session_state.knowledge_base,
+                        new_chunks,
+                    )
+
+        else:
+
+            kb_update = {
+                "added": 0,
+                "skipped": 0,
+                "total_chunks": (
+                    len(st.session_state.knowledge_base["chunks"])
+                    if st.session_state.knowledge_base
+                    else 0
+                ),
+            }
+
+        # Store document metadata only after KB update succeeds.
+
+        for document in new_documents:
+
+            st.session_state.processed_documents[
+                document["hash"]
+            ] = document
+
+    except Exception as error:
 
         st.error(
-            "No readable text could be extracted "
-            "from the uploaded documents."
+            f"Knowledge base update failed: {error}"
         )
 
         st.stop()
 
-    st.success(
-        f"Successfully extracted {len(successful_files)} "
-        f"out of {len(uploaded_files)} documents."
-    )
+    if duplicate_uploads:
 
-    # --------------------------------------------------
-    # STEP 2: REMOVE DUPLICATE CONTENT
-    # --------------------------------------------------
+        st.info(
+            f"{duplicate_uploads} already-processed upload(s) were skipped."
+        )
 
-    st.header("2. Duplicate Content Removal")
+    if extraction_failures:
 
-    original_text = "\n\n".join(
-        content for _, content in all_documents
-    )
+        st.warning(
+            "Could not extract readable text from: "
+            + ", ".join(extraction_failures)
+        )
 
-    cleaned_text, duplicate_count = deduplicate_documents(
-        all_documents
-    )
-
-    st.write(
-        f"**Original text length:** "
-        f"{len(original_text):,} characters"
-    )
-
-    st.write(
-        f"**Cleaned text length:** "
-        f"{len(cleaned_text):,} characters"
-    )
-
-    st.write(
-        f"**Repeated lines removed:** {duplicate_count}"
-    )
-
-    if duplicate_count > 0:
+    if new_documents:
 
         st.success(
-            "Repeated content was removed while "
-            "preserving unique lines."
+            f"Successfully processed {len(new_documents)} new document(s)."
+        )
+
+    elif not st.session_state.processed_documents:
+
+        st.warning(
+            "No readable project documents have been processed yet."
         )
 
     else:
 
         st.info(
-            "No exact repeated lines were detected."
+            "No new documents were found. Re-analyzing retained documents."
         )
 
-    # --------------------------------------------------
-    # STEP 3: TEXT CHUNKING
-    # --------------------------------------------------
+    st.write(
+        f"**New chunks added to the knowledge base:** {kb_update['added']}"
+    )
 
-    st.header("3. Document Processing")
+    st.write(
+        f"**Duplicate chunks skipped:** {kb_update['skipped']}"
+    )
 
-    try:
+    st.write(
+        f"**Total knowledge-base chunks:** {kb_update['total_chunks']}"
+    )
 
-        chunks = split_text(
-            cleaned_text,
-            chunk_size=500,
-            overlap=50,
+    # Consolidate all retained documents.
+
+    retained_documents = [
+        (document["file_name"], document["text"])
+        for document in st.session_state.processed_documents.values()
+    ]
+
+    if retained_documents:
+
+        original_text = "\n\n".join(
+            content for _, content in retained_documents
         )
 
-        if chunks is None:
-            chunks = []
-
-        st.write(
-            f"**Chunks generated:** {len(chunks)}"
+        cleaned_text, duplicate_count = deduplicate_documents(
+            retained_documents
         )
 
-        with st.expander("View generated text chunks"):
+        with st.spinner(
+            "Running consolidated project analysis..."
+        ):
 
-            for index, chunk in enumerate(
-                chunks,
-                start=1
-            ):
-
-                chunk_text = (
-                    chunk
-                    if isinstance(chunk, str)
-                    else str(chunk)
-                )
-
-                st.markdown(
-                    f"**Chunk {index}**"
-                )
-
-                st.code(
-                    chunk_text,
-                    language=None
-                )
-
-                st.caption(
-                    f"Characters: {len(chunk_text)}"
-                )
-
-    except Exception as error:
-
-        st.error(
-            f"Text chunking failed: {error}"
-        )
-
-        chunks = []
-
-    # --------------------------------------------------
-    # BUILD KNOWLEDGE BASE
-    # --------------------------------------------------
-
-    if chunks:
-
-        try:
-
-            with st.spinner(
-                "Building conversational knowledge base..."
-            ):
-
-                knowledge_base = build_knowledge_base(
-                    chunks
-                )
-
-                st.session_state.knowledge_base = knowledge_base
-                st.session_state.processed_files_hash = current_files_hash
-
-            st.success(
-                "Conversational knowledge base created successfully."
+            analysis = run_consolidated_analysis(
+                cleaned_text
             )
 
-        except Exception as error:
+        analysis["metrics"] = {
+            "files_processed": len(retained_documents),
+            "original_text_length": len(original_text),
+            "cleaned_text_length": len(cleaned_text),
+            "duplicate_lines_removed": duplicate_count,
+            "knowledge_base_chunks": (
+                len(st.session_state.knowledge_base["chunks"])
+                if st.session_state.knowledge_base
+                else 0
+            ),
+        }
 
-            st.session_state.knowledge_base = None
-            st.session_state.processed_files_hash = None
+        st.session_state.analysis_results = analysis
+        st.session_state.last_qa = None
 
-            st.error(
-                f"Knowledge base creation failed: {error}"
-            )
+        st.success(
+            "Project analysis updated successfully."
+        )
 
     else:
 
+        st.session_state.analysis_results = None
+
+
+# --------------------------------------------------
+# CLEAR SESSION DATA
+# --------------------------------------------------
+
+if st.session_state.processed_documents:
+
+    if st.button("Clear All Processed Project Data"):
+
         st.session_state.knowledge_base = None
-        st.session_state.processed_files_hash = None
+        st.session_state.processed_documents = {}
+        st.session_state.analysis_results = None
+        st.session_state.last_qa = None
 
-        st.warning(
-            "No chunks are available to build the knowledge base."
-        )
+        st.rerun()
 
-    # --------------------------------------------------
-    # CONSOLIDATED ANALYSIS
-    # --------------------------------------------------
+
+# --------------------------------------------------
+# PROJECT INSIGHTS AND RISK SUMMARY DASHBOARD
+# --------------------------------------------------
+
+analysis = st.session_state.analysis_results
+
+
+if analysis:
 
     st.divider()
 
-    st.header("4. Consolidated Analysis Report")
+    st.header(
+        "9. Project Insights and Risk Summary Dashboard"
+    )
 
-    scope_results = {}
-    unique_risks = []
-    blockers = []
-    action_items = []
+    health = analysis.get("health")
+    risks = analysis.get("risks", [])
+    actions = analysis.get("action_items", [])
+    active_blockers = analysis.get("blockers", [])
+    resolved_blockers = analysis.get("resolved_blockers", [])
+    scope_results = analysis.get("scope_results", {})
 
-    # --------------------------------------------------
-    # STEP 4: SCOPE ANALYSIS
-    # --------------------------------------------------
+    if health:
+
+        metric_columns = st.columns(4)
+
+        metric_columns[0].metric(
+            "Project Health",
+            f"{health.get('overall_score', 'N/A')}/100",
+            health.get("health_status", ""),
+        )
+
+        metric_columns[1].metric(
+            "Risks",
+            len(risks)
+        )
+
+        metric_columns[2].metric(
+            "Action Items",
+            len(actions)
+        )
+
+        metric_columns[3].metric(
+            "Documents",
+            analysis.get("metrics", {}).get(
+                "files_processed", 0
+            ),
+        )
+
+        score = health.get("overall_score", 0)
+
+        st.progress(
+            max(0, min(100, score)) / 100
+        )
+
+    else:
+
+        st.warning(
+            "The project health score is not available."
+        )
+
+    with st.expander(
+        "Scope Summary",
+        expanded=True
+    ):
+
+        render_scope_summary(scope_results)
+
+    dashboard_columns = st.columns(2)
+
+    with dashboard_columns[0]:
+
+        st.subheader("Extracted Risks")
+
+        render_list_of_items(
+            risks,
+            "Risk"
+        )
+
+    with dashboard_columns[1]:
+
+        st.subheader("Action Items")
+
+        render_list_of_items(
+            actions,
+            "Action"
+        )
+
+    st.subheader("Blocker Status")
+
+    blocker_columns = st.columns(2)
+
+    with blocker_columns[0]:
+
+        st.markdown("**Active Blockers**")
+
+        render_list_of_items(
+            active_blockers,
+            "Active Blocker"
+        )
+
+    with blocker_columns[1]:
+
+        st.markdown("**Resolved Blockers**")
+
+        render_list_of_items(
+            resolved_blockers,
+            "Resolved Blocker"
+        )
+
+    if analysis.get("errors"):
+
+        with st.expander("Analysis warnings"):
+
+            for section, message in analysis["errors"].items():
+
+                st.warning(
+                    f"{section.replace('_', ' ').title()}: {message}"
+                )
+
+
+# --------------------------------------------------
+# CONSOLIDATED ANALYSIS REPORT
+# --------------------------------------------------
+
+if analysis:
+
+    st.divider()
+
+    st.header("Consolidated Analysis Report")
 
     st.subheader("1. Scope and Deliverables")
 
-    try:
-
-        scope_results = extract_scope(cleaned_text)
-
-        if isinstance(scope_results, dict):
-
-            for category, details in scope_results.items():
-
-                st.markdown(
-                    f"**{str(category).replace('_', ' ').title()}**"
-                )
-
-                if isinstance(details, (list, tuple)):
-
-                    if details:
-
-                        for detail in details:
-                            st.write(f"- {detail}")
-
-                    else:
-
-                        st.write(
-                            "No matching information found."
-                        )
-
-                elif details:
-
-                    st.write(details)
-
-                else:
-
-                    st.write(
-                        "No matching information found."
-                    )
-
-        elif scope_results:
-
-            for item in to_list(scope_results):
-                display_item(item)
-
-        else:
-
-            st.info(
-                "No scope information was detected."
-            )
-
-    except Exception as error:
-
-        st.error(
-            f"Scope analysis failed: {error}"
-        )
-
-    # --------------------------------------------------
-    # STEP 5: RISK DETECTION
-    # --------------------------------------------------
+    render_scope_summary(
+        analysis.get("scope_results", {})
+    )
 
     st.subheader("2. Risk Detection")
 
-    try:
+    risks = analysis.get("risks", [])
 
-        raw_risks = detect_risks(cleaned_text)
+    st.write(
+        f"**Unique risks detected: {len(risks)}**"
+    )
 
-        for risk in to_list(raw_risks):
-            add_unique(unique_risks, risk)
-
-        if unique_risks:
-
-            st.write(
-                f"**Unique risks detected: "
-                f"{len(unique_risks)}**"
-            )
-
-            for index, risk in enumerate(
-                unique_risks,
-                start=1
-            ):
-
-                with st.container(border=True):
-
-                    st.markdown(
-                        f"**Risk {index}**"
-                    )
-
-                    display_item(risk)
-
-        else:
-
-            st.info(
-                "No risks were detected."
-            )
-
-    except Exception as error:
-
-        st.error(
-            f"Risk detection failed: {error}"
-        )
-
-    # --------------------------------------------------
-    # STEP 6: BLOCKERS AND ACTION ITEMS
-    # --------------------------------------------------
+    render_list_of_items(
+        risks,
+        "Risk"
+    )
 
     st.subheader("3. Blockers and Action Items")
 
-    try:
+    st.markdown("**Active Blockers**")
 
-        action_results = identify_blockers_and_actions(
-            cleaned_text
-        )
+    render_list_of_items(
+        analysis.get("blockers", []),
+        "Active Blocker"
+    )
 
-        blockers = []
-        action_items = []
+    st.markdown("**Resolved Blockers**")
 
-        if isinstance(action_results, dict):
+    render_list_of_items(
+        analysis.get("resolved_blockers", []),
+        "Resolved Blocker"
+    )
 
-            raw_blockers = action_results.get(
-                "blockers",
-                action_results.get(
-                    "identified_blockers",
-                    []
-                ),
-            )
+    st.markdown("**Action Items**")
 
-            raw_actions = action_results.get(
-                "action_items",
-                action_results.get(
-                    "actions",
-                    action_results.get(
-                        "identified_actions",
-                        []
-                    ),
-                ),
-            )
-
-            for item in to_list(raw_blockers):
-                add_unique(blockers, item)
-
-            for item in to_list(raw_actions):
-                add_unique(action_items, item)
-
-        elif (
-            isinstance(action_results, tuple)
-            and len(action_results) == 2
-        ):
-
-            for item in to_list(action_results[0]):
-                add_unique(blockers, item)
-
-            for item in to_list(action_results[1]):
-                add_unique(action_items, item)
-
-        elif action_results:
-
-            for item in to_list(action_results):
-                add_unique(action_items, item)
-
-        # DISPLAY BLOCKERS
-
-        st.markdown("**Identified Blockers**")
-
-        if blockers:
-
-            for index, blocker in enumerate(
-                blockers,
-                start=1
-            ):
-
-                st.markdown(
-                    f"**Blocker {index}**"
-                )
-
-                display_item(blocker)
-
-        else:
-
-            st.info(
-                "No blockers were detected."
-            )
-
-        # DISPLAY ACTION ITEMS
-
-        st.markdown("**Action Items**")
-
-        if action_items:
-
-            for index, action in enumerate(
-                action_items,
-                start=1
-            ):
-
-                st.markdown(
-                    f"**Action {index}**"
-                )
-
-                display_item(action)
-
-        else:
-
-            st.info(
-                "No action items were detected."
-            )
-
-    except Exception as error:
-
-        st.error(
-            f"Blocker and action item analysis failed: {error}"
-        )
+    render_list_of_items(
+        analysis.get("action_items", []),
+        "Action"
+    )
 
     # --------------------------------------------------
-    # STEP 7: DOCUMENTATION GENERATION
+    # DOCUMENTATION GENERATION
     # --------------------------------------------------
 
     st.divider()
 
-    st.header("5. Documentation Generation")
+    st.header("Documentation Generation")
 
-    try:
+    documentation = analysis.get(
+        "documentation", {}
+    )
 
-        documentation = generate_documentation(
-            scope_results,
-            unique_risks,
-            action_items
-        )
+    user_stories = documentation.get(
+        "user_stories", []
+    ) or []
 
-        if not isinstance(documentation, dict):
-            documentation = {}
+    risk_register = documentation.get(
+        "risk_register", []
+    ) or []
 
-        user_stories = documentation.get(
-            "user_stories", []
-        ) or []
+    action_report = documentation.get(
+        "action_item_report", []
+    ) or []
 
-        risk_register = documentation.get(
-            "risk_register", []
-        ) or []
+    st.subheader("1. Generated User Stories")
 
-        action_report = documentation.get(
-            "action_item_report", []
-        ) or []
+    if user_stories:
 
-        # USER STORIES
-
-        st.subheader("1. Generated User Stories")
-
-        if user_stories:
-
-            st.dataframe(
-                user_stories,
-                width="stretch",
-                hide_index=True
-            )
-
-            st.download_button(
-                label="Download User Stories (CSV)",
-                data=records_to_csv(user_stories),
-                file_name="user_stories.csv",
-                mime="text/csv"
-            )
-
-        else:
-
-            st.warning(
-                "No user stories could be generated."
-            )
-
-        # RISK REGISTER
-
-        st.subheader("2. Generated Risk Register")
-
-        if risk_register:
-
-            st.dataframe(
-                risk_register,
-                width="stretch",
-                hide_index=True
-            )
-
-            st.download_button(
-                label="Download Risk Register (CSV)",
-                data=records_to_csv(risk_register),
-                file_name="risk_register.csv",
-                mime="text/csv"
-            )
-
-        else:
-
-            st.warning(
-                "No risk register entries were generated."
-            )
-
-        # ACTION ITEM REPORT
-
-        st.subheader("3. Generated Action Item Report")
-
-        if action_report:
-
-            st.dataframe(
-                action_report,
-                width="stretch",
-                hide_index=True
-            )
-
-            st.download_button(
-                label="Download Action Item Report (CSV)",
-                data=records_to_csv(action_report),
-                file_name="action_item_report.csv",
-                mime="text/csv"
-            )
-
-        else:
-
-            st.warning(
-                "No action item report entries were generated."
-            )
-
-        # COMPLETE DOCUMENTATION DOWNLOAD
-
-        st.subheader("Download Complete Documentation")
-
-        documentation_json = json.dumps(
-            documentation,
-            indent=4,
-            ensure_ascii=False
+        st.dataframe(
+            user_stories,
+            width="stretch",
+            hide_index=True
         )
 
         st.download_button(
-            label="Download All Documentation (JSON)",
-            data=documentation_json,
+            "Download User Stories (CSV)",
+            data=records_to_csv(user_stories),
+            file_name="user_stories.csv",
+            mime="text/csv",
+        )
+
+    else:
+
+        st.warning(
+            "No user stories could be generated."
+        )
+
+    st.subheader("2. Generated Risk Register")
+
+    if risk_register:
+
+        st.dataframe(
+            risk_register,
+            width="stretch",
+            hide_index=True
+        )
+
+        st.download_button(
+            "Download Risk Register (CSV)",
+            data=records_to_csv(risk_register),
+            file_name="risk_register.csv",
+            mime="text/csv",
+        )
+
+    else:
+
+        st.warning(
+            "No risk register entries were generated."
+        )
+
+    st.subheader("3. Generated Action Item Report")
+
+    if action_report:
+
+        st.dataframe(
+            action_report,
+            width="stretch",
+            hide_index=True
+        )
+
+        st.download_button(
+            "Download Action Item Report (CSV)",
+            data=records_to_csv(action_report),
+            file_name="action_item_report.csv",
+            mime="text/csv",
+        )
+
+    else:
+
+        st.warning(
+            "No action item report entries were generated."
+        )
+
+    if documentation:
+
+        st.subheader(
+            "Download Complete Documentation"
+        )
+
+        st.download_button(
+            "Download All Documentation (JSON)",
+            data=json.dumps(
+                documentation,
+                indent=4,
+                ensure_ascii=False,
+            ),
             file_name="project_documentation.json",
             mime="application/json",
-            type="primary"
-        )
-
-        if user_stories or risk_register or action_report:
-
-            st.success(
-                "Documentation generation completed."
-            )
-
-        else:
-
-            st.error(
-                "Documentation generation returned empty results."
-            )
-
-    except Exception as error:
-
-        st.error(
-            f"Documentation generation failed: {error}"
+            type="primary",
         )
 
     # --------------------------------------------------
-    # STEP 8: PROJECT HEALTH SCORING
+    # PROJECT HEALTH SCORING
     # --------------------------------------------------
 
-    st.divider()
+    health = analysis.get("health")
 
-    st.header("6. Project Health Score")
+    if health:
 
-    try:
+        st.divider()
 
-        health = calculate_health_score(
-            scope_results,
-            unique_risks,
-            blockers
-        )
-
-        overall_score = health["overall_score"]
-
-        st.subheader("Overall Project Health")
+        st.header("Project Health Score")
 
         st.metric(
-            label="Project Health Score",
-            value=f"{overall_score}/100",
-            delta=health["health_status"]
+            "Project Health Score",
+            f"{health['overall_score']}/100",
+            health["health_status"],
         )
 
         st.progress(
-            max(0, min(100, overall_score)) / 100
+            max(0, min(100, health["overall_score"])) / 100
         )
-
-        st.subheader("Health Score Breakdown")
 
         health_breakdown = [
             {
                 "Dimension": "Scope Clarity",
                 "Score": health["scope_score"],
-                "Maximum Score": health["scope_max"]
+                "Maximum Score": health["scope_max"],
             },
             {
                 "Dimension": "Timeline Health",
                 "Score": health["timeline_score"],
-                "Maximum Score": health["timeline_max"]
+                "Maximum Score": health["timeline_max"],
             },
             {
                 "Dimension": "Blocker Status",
                 "Score": health["blocker_score"],
-                "Maximum Score": health["blocker_max"]
-            }
+                "Maximum Score": health["blocker_max"],
+            },
         ]
 
         st.dataframe(
             health_breakdown,
             width="stretch",
-            hide_index=True
+            hide_index=True,
         )
 
         st.subheader("Detected Project Concerns")
 
         st.write(
-            f"Schedule risks detected: "
-            f"{health['schedule_risks']}"
+            f"Schedule risks detected: {health['schedule_risks']}"
         )
 
         st.write(
-            f"Blockers detected: "
-            f"{health['blocker_count']}"
+            f"Blockers detected: {health['blocker_count']}"
         )
 
-        if health["milestone_conflict"]:
+        if health.get("milestone_conflict"):
 
             st.warning(
                 "Conflicting testing milestones detected. "
@@ -964,77 +1073,70 @@ if st.button(
                 "The project is at risk."
             )
 
-    except Exception as error:
-
-        st.error(
-            f"Health scoring failed: {error}"
-        )
-
     # --------------------------------------------------
-    # STEP 9: PROCESSING SUMMARY
+    # PROCESSING SUMMARY
     # --------------------------------------------------
+
+    metrics = analysis.get("metrics", {})
 
     st.divider()
 
-    st.subheader("7. Processing Summary")
+    st.subheader("Processing Summary")
 
     st.write(
-        f"- Files uploaded: {len(uploaded_files)}"
+        f"- Files processed: {metrics.get('files_processed', 0)}"
     )
 
     st.write(
-        f"- Files successfully extracted: "
-        f"{len(successful_files)}"
+        f"- Repeated lines removed: "
+        f"{metrics.get('duplicate_lines_removed', 0)}"
     )
 
     st.write(
-        f"- Repeated lines removed: {duplicate_count}"
+        f"- Original text length: "
+        f"{metrics.get('original_text_length', 0):,} characters"
     )
 
     st.write(
         f"- Cleaned text length: "
-        f"{len(cleaned_text):,} characters"
+        f"{metrics.get('cleaned_text_length', 0):,} characters"
     )
 
     st.write(
-        f"- Text chunks generated: {len(chunks)}"
+        f"- Knowledge-base chunks: "
+        f"{metrics.get('knowledge_base_chunks', 0)}"
     )
 
-    st.write(
-        f"- Unique risks detected: {len(unique_risks)}"
-    )
+    with st.expander("View processed files"):
 
-    st.write(
-        f"- Blockers detected: {len(blockers)}"
-    )
+        for document in st.session_state.processed_documents.values():
 
-    st.write(
-        f"- Action items detected: {len(action_items)}"
-    )
-
-    with st.expander("View successfully processed files"):
-
-        for filename in successful_files:
-            st.write(f"- {filename}")
+            st.write(
+                f"- {document['file_name']}"
+            )
 
     with st.expander("View cleaned consolidated text"):
 
-        st.text(cleaned_text)
-
+        st.text(
+            analysis.get("cleaned_text", "")
+        )
 
 
 # --------------------------------------------------
-# STEP 10: CONVERSATIONAL PROJECT INTELLIGENCE ASSISTANT
+# CONVERSATIONAL PROJECT INTELLIGENCE ASSISTANT
 # --------------------------------------------------
 
 st.divider()
 
-st.header("8. Conversational Project Intelligence Assistant")
+st.header(
+    "Conversational Project Intelligence Assistant"
+)
 
 st.write(
     "Ask questions about your uploaded project documents. "
-    "The assistant retrieves relevant information from the documents."
+    "The assistant retrieves relevant information from the retained knowledge base."
 )
+
 
 if st.session_state.knowledge_base:
 
@@ -1043,7 +1145,6 @@ if st.session_state.knowledge_base:
         question = st.text_input(
             "Enter your project-related question:",
             placeholder="Example: Why is testing delayed?",
-            key="project_question_input"
         )
 
         submit_question = st.form_submit_button(
@@ -1054,67 +1155,103 @@ if st.session_state.knowledge_base:
 
         if not question.strip():
 
-            st.warning("Please enter a question.")
+            st.warning(
+                "Please enter a question."
+            )
 
         else:
 
             try:
 
-                with st.spinner("Searching project documents..."):
+                with st.spinner(
+                    "Searching project documents..."
+                ):
 
                     results = ask_project_question(
                         question,
                         st.session_state.knowledge_base,
-                        top_k=3
+                        top_k=3,
                     )
+
                     answer_data = generate_project_answer(
                         question,
-                        results
+                        results,
                     )
 
-                st.subheader("Generated Answer")
-
-                st.write(answer_data["answer"])
-
-                st.markdown("### Key Findings")
-
-                for finding in answer_data["key_findings"]:
-                    st.markdown(f"- {finding}")
-
-                if answer_data["suggested_actions"]:
-
-                    st.markdown("### Related Action Items")
-
-                    for action in answer_data["suggested_actions"]:
-                        st.markdown(f"- {action}")
-
-                if results:
-
-                    st.subheader("Retrieved Information")
-
-                    for number, result in enumerate(results, start=1):
-
-                        st.markdown(
-                            f"**Relevant Excerpt {number}**"
-                        )
-
-                        st.write(result["chunk"])
-
-                        st.caption(
-                            f"Similarity score: {result['score']:.3f}"
-                        )
-
-                else:
-
-                    st.warning(
-                        "No relevant information was found."
-                    )
+                st.session_state.last_qa = {
+                    "question": question,
+                    "answer_data": answer_data,
+                    "results": results,
+                }
 
             except Exception as error:
 
                 st.error(
                     f"Unable to answer the question: {error}"
                 )
+
+    last_qa = st.session_state.last_qa
+
+    if last_qa:
+
+        st.subheader("Generated Answer")
+
+        st.write(
+            last_qa["answer_data"].get("answer", "")
+        )
+
+        st.markdown("### Key Findings")
+
+        for finding in last_qa["answer_data"].get(
+            "key_findings", []
+        ):
+
+            st.markdown(
+                f"- {finding}"
+            )
+
+        suggested_actions = last_qa["answer_data"].get(
+            "suggested_actions", []
+        )
+
+        if suggested_actions:
+
+            st.markdown("### Related Action Items")
+
+            for action in suggested_actions:
+
+                st.markdown(
+                    f"- {action}"
+                )
+
+        results = last_qa.get("results", [])
+
+        if results:
+
+            st.subheader("Retrieved Information")
+
+            for number, result in enumerate(
+                results,
+                start=1
+            ):
+
+                st.markdown(
+                    f"**Relevant Excerpt {number}**"
+                )
+
+                st.write(
+                    result["chunk"]
+                )
+
+                st.caption(
+                    f"Similarity score: {result['score']:.3f}"
+                )
+
+        else:
+
+            st.warning(
+                "No relevant information was found."
+            )
 
 else:
 

@@ -13,7 +13,7 @@ RISK_PATTERNS = {
         r"\binsufficient time to complete\b",
         r"\bdeadline may be missed\b",
         r"\bmay miss (?:the )?(?:sprint )?deadline\b",
-        r"\bdeadline.*(?:at risk|missed|delay)\b",
+        r"\bdeadline.{0,80}(?:at risk|missed|delay)\b",
         r"\bproject may not finish on time\b",
         r"\bdevelopment is behind schedule\b",
     ],
@@ -34,6 +34,14 @@ RISK_PATTERNS = {
         r"\bexternal dependency may delay\b",
         r"\bdependency delay may affect\b",
         r"\bdependency may affect the deadline\b",
+        r"\bwaiting for .*dependency approval\b",
+        r"\bwaiting for dependency approval\b",
+        r"\bdependency approval (?:is )?pending\b",
+        r"\bawaiting .*dependency approval\b",
+        r"\bdependency approval delayed\b",
+        r"\bdependency not approved\b",
+        r"\bdependency is pending\b",
+        r"\bwaiting for .*approval\b",
     ],
 
     "Resource Risk": [
@@ -48,44 +56,36 @@ RISK_PATTERNS = {
 
 
 def normalize_text(text):
-    """Normalize whitespace."""
+    """Normalize whitespace and safely handle empty values."""
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
 def clean_risk_line(line):
-    """
-    Remove bullet symbols, numbering and discussion labels
-    before analyzing a line.
-    """
-
+    """Remove bullets, numbering, and discussion labels."""
     line = normalize_text(line)
 
-    # Remove leading bullet symbols.
-    line = re.sub(r"^[•●▪◦*-]+\s*", "", line)
+    # Remove bullet symbols.
+    line = re.sub(r"^[•●▪◦*\-]+\s*", "", line)
 
     # Remove numbering such as 1. or 2)
     line = re.sub(r"^\d+[.)]\s*", "", line)
 
-    # Remove Discussion label but preserve its content.
+    # Remove Discussion: prefix.
     line = re.sub(
         r"^Discussion\s*:\s*",
         "",
         line,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
 
     return normalize_text(line)
 
 
 def is_non_risk_entry(line):
-    """
-    Exclude issue labels, action items, blockers,
-    decisions and other non-risk entries.
-    """
-
+    """Ignore entries explicitly labelled as issues, actions, or decisions."""
     text = normalize_text(line).casefold()
 
-    excluded_prefixes = (
+    prefixes = (
         "issue:",
         "action item:",
         "blocker:",
@@ -93,17 +93,11 @@ def is_non_risk_entry(line):
         "todo:",
     )
 
-    return text.startswith(excluded_prefixes)
+    return text.startswith(prefixes)
 
 
 def is_heading_only(raw_line, cleaned_line):
-    """
-    Exclude numbered headings such as:
-    3. Testing behind schedule
-
-    Preserve complete risk statements.
-    """
-
+    """Ignore short numbered headings rather than treating them as risks."""
     has_numbering = bool(
         re.match(r"^\s*\d+[.)]\s*", raw_line)
     )
@@ -111,119 +105,112 @@ def is_heading_only(raw_line, cleaned_line):
     if not has_numbering:
         return False
 
-    # A short heading without sentence punctuation or
-    # a clear modal verb is treated as a section heading.
-    heading_words = cleaned_line.split()
+    words = cleaned_line.split()
 
-    modal_or_action_words = {
+    modal_words = {
         "may", "might", "could", "will", "should",
         "cannot", "can't", "must", "is", "are",
-        "has", "have", "was", "were"
+        "has", "have", "was", "were",
     }
 
-    contains_sentence_word = any(
-        word.casefold() in modal_or_action_words
-        for word in heading_words
+    has_sentence_word = any(
+        word.casefold() in modal_words
+        for word in words
     )
 
-    has_sentence_punctuation = bool(
+    has_punctuation = bool(
         re.search(r"[.!?]$", cleaned_line)
     )
 
     return (
-        2 <= len(heading_words) <= 6
-        and not contains_sentence_word
-        and not has_sentence_punctuation
+        2 <= len(words) <= 6
+        and not has_sentence_word
+        and not has_punctuation
     )
 
 
 def get_risk_category(line):
-    """Return the first matching risk category."""
-
-    category_priority = [
+    """Identify the most specific matching risk category."""
+    priority = [
         "Testing Risk",
         "Dependency Risk",
         "Resource Risk",
         "Schedule Risk",
     ]
 
-    matched_categories = []
-
-    for category, patterns in RISK_PATTERNS.items():
-
+    matches = [
+        category
+        for category, patterns in RISK_PATTERNS.items()
         if any(
             re.search(pattern, line, re.IGNORECASE)
             for pattern in patterns
-        ):
-            matched_categories.append(category)
+        )
+    ]
 
-    for category in category_priority:
-
-        if category in matched_categories:
-            return category
-
-    return None
+    return next(
+        (category for category in priority if category in matches),
+        None,
+    )
 
 
 def canonical_risk(description):
-    """Create a key to consolidate closely related risk statements."""
-
+    """Create a common key for descriptions referring to the same risk."""
     text = normalize_text(description).casefold()
 
-    if (
-        "not enough time to test" in text
-        or "insufficient time to test" in text
-        or "insufficient time for testing" in text
-        or "may not complete testing" in text
-    ):
+    # Similar testing-risk descriptions.
+    if any(term in text for term in (
+        "not enough time to test",
+        "insufficient time to test",
+        "insufficient time for testing",
+        "may not complete testing",
+    )):
         return "insufficient_testing_time"
 
-    if (
-        "deadline may be missed" in text
-        or "may miss the deadline" in text
-        or "may miss sprint deadline" in text
-        or "may not finish on time" in text
-    ):
+    # Similar deadline-risk descriptions.
+    if any(term in text for term in (
+        "deadline may be missed",
+        "may miss the deadline",
+        "may miss sprint deadline",
+        "may not finish on time",
+        "deadline is at risk",
+    )):
         return "deadline_at_risk"
 
-    return text
+    # Normalize remaining descriptions.
+    text = re.sub(r"[^\w\s]", " ", text)
+    return normalize_text(text)
 
 
 def detect_risks(text):
     """
-    Detect potential project risks.
+    Detect and deduplicate potential risks.
 
-    Returns:
-        [
-            {
-                "category": "Schedule Risk",
-                "description": "..."
-            }
-        ]
+    Output format:
+    [
+        {
+            "category": "Schedule Risk",
+            "description": "..."
+        }
+    ]
     """
-
     if not text or not str(text).strip():
         return []
 
     risks = []
-    seen_risks = set()
+    seen = set()
 
     for raw_line in str(text).splitlines():
-
         if not normalize_text(raw_line):
             continue
 
-        # Clean bullets, numbering and discussion prefixes.
         line = clean_risk_line(raw_line)
 
         if not line:
             continue
 
-        # Ignore numbered section headings.
         if is_heading_only(raw_line, line):
             continue
 
-        # Ignore explicitly labelled issues and tasks.
         if is_non_risk_entry(line):
             continue
 
@@ -232,16 +219,97 @@ def detect_risks(text):
         if category is None:
             continue
 
-        risk_key = canonical_risk(line)
+        key = (category, canonical_risk(line))
 
-        if risk_key in seen_risks:
-            continue
-
-        risks.append({
-            "category": category,
-            "description": line,
-        })
-
-        seen_risks.add(risk_key)
+        if key not in seen:
+            risks.append({
+                "category": category,
+                "description": line,
+            })
+            seen.add(key)
 
     return risks
+
+
+def reconcile_risks(text, risks=None):
+    """
+    Add a status field to each detected risk.
+
+    Risks remain Active unless the source contains explicit
+    evidence that the corresponding risk has been resolved.
+
+    For example, 'testing resumed' alone does not mean
+    that all testing risks have been resolved.
+    """
+    source = str(text or "").casefold()
+
+    risks = (
+        detect_risks(text)
+        if risks is None
+        else list(risks)
+    )
+
+    reconciled = []
+
+    for risk in risks:
+        item = dict(risk)
+
+        description = str(
+            item.get("description", "")
+        ).casefold()
+
+        category = str(
+            item.get("category", "")
+        ).casefold()
+
+        resolved = False
+
+        # Testing risks require explicit testing completion.
+        if category == "testing risk" or "testing" in description or "test cases" in description:
+            resolved = any(phrase in source for phrase in (
+                "all test cases completed",
+                "testing completed successfully",
+                "testing is complete",
+                "all modules passed testing",
+                "all testing activities completed",
+            ))
+
+        # Schedule risks require evidence that the schedule
+        # or project deadline was successfully met.
+        elif category == "schedule risk" or "deadline" in description or "schedule" in description:
+            resolved = any(phrase in source for phrase in (
+                "project delivered on time",
+                "deadline met",
+                "project completed",
+                "schedule risk resolved",
+                "project completed within schedule",
+            ))
+
+        # Dependency risks require explicit approval or
+        # dependency completion evidence.
+        elif category == "dependency risk" or "dependency" in description:
+            resolved = any(phrase in source for phrase in (
+                "dependency approved",
+                "approval received",
+                "approval granted",
+                "dependency completed",
+                "dependency resolved",
+            ))
+
+        # Resource risks require explicit resource recovery.
+        elif category == "resource risk" or "resource" in description:
+            resolved = any(phrase in source for phrase in (
+                "resources allocated",
+                "additional resources assigned",
+                "staff shortage resolved",
+                "team member available",
+                "resource constraints resolved",
+            ))
+
+        item["status"] = (
+            "Resolved" if resolved else "Active"
+        )
+
+        reconciled.append(item)
+
+    return reconciled
