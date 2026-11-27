@@ -1,0 +1,12 @@
+Project objective: Develop an AI-based student attendance system.
+Deliverable: Submit the final project report.
+Milestone: Complete testing by Week 4.
+Responsible for testing: Ravi.
+
+The project deadline may be missed.
+We are waiting for dependency approval.
+There is not enough time to test all modules.
+
+Testing is blocked because the test server is unavailable.
+Action item: Prepare the test cases.
+Assigned to Priya: Complete the database documentation.

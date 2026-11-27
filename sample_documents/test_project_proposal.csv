@@ -1,0 +1,15 @@
+Project Details
+Project Title: Student Attendance Management System
+Project objective: Develop a web-based system that allows faculty members to record student attendance and view attendance reports.
+"Deliverable: Submit the working application, source code, and final project report."
+Milestone: Complete database design by Week 2.
+Milestone: Complete application development by Week 4.
+Milestone: Finish system testing by Week 5.
+Responsible for testing: Ravi.
+The project deadline may be missed because application development is behind schedule.
+We are waiting for dependency approval before integrating the authentication module.
+There is not enough time to test all modules before the final submission.
+Testing is blocked because the test server is unavailable.
+Action item: Prepare the test cases.
+Assigned to Priya: Complete the database documentation.
+Follow up with the infrastructure team about test server access.
